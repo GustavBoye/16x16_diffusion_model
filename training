@@ -1,0 +1,287 @@
+import os
+import math
+import glob
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from PIL import Image
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from torchvision.utils import save_image
+
+# ----------------------------
+# Config
+# ----------------------------
+DATA_DIR = r"C:\Users\G_Cha\PycharmProjects\PythonProject1\01_Data\02_Traindata_24x24"
+OUT_DIR = "deep_flow_matching_24x24_cond"
+CHECKPOINT_PATH = f"{OUT_DIR}/checkpoint.pth"
+IMG_SIZE = 24
+LR = 0.0081
+NOISE = 0.05
+BATCH_SIZE = 32
+EPOCHS = 200
+PREVIEW_EVERY = 500
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+os.makedirs(OUT_DIR, exist_ok=True)
+os.makedirs(f"{OUT_DIR}/previews", exist_ok=True)
+
+
+# ----------------------------
+# Helper Modules
+# ----------------------------
+
+def timestep_embedding(t, dim):
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000) * torch.arange(0, half, device=t.device) / half)
+    args = t[:, None].float() * freqs[None]
+    return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, channels, heads=4, dropout=0.0):
+        super().__init__()
+        assert channels % heads == 0
+        self.heads = heads
+        self.dim_head = channels // heads
+        self.scale = self.dim_head ** -0.5
+        self.norm = nn.GroupNorm(min(32, channels), channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=False)
+        self.proj = nn.Conv2d(channels, channels, 1)
+        self.dropout = nn.Dropout(dropout)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+        self.gamma = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h)
+        q, k, v = qkv.chunk(3, dim=1)
+        q = q.view(B, self.heads, self.dim_head, H * W).transpose(2, 3)
+        k = k.view(B, self.heads, self.dim_head, H * W)
+        v = v.view(B, self.heads, self.dim_head, H * W).transpose(2, 3)
+        attn = torch.matmul(q, k) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn)
+        out = torch.matmul(attn, v)
+        out = out.transpose(2, 3).contiguous().view(B, C, H, W)
+        return x + self.gamma * self.proj(out)
+
+
+class WideResBlock(nn.Module):
+    def __init__(self, in_c, out_c, t_dim, negative_slope=0.2):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(min(32, in_c), in_c)
+        self.act = nn.LeakyReLU(negative_slope, inplace=True)
+        self.t_act = nn.LeakyReLU(negative_slope, inplace=False)
+        self.conv1 = nn.Conv2d(in_c, out_c, 3, padding=1)
+        self.t_mlp = nn.Linear(t_dim, out_c)
+        self.norm2 = nn.GroupNorm(min(32, out_c), out_c)
+        self.conv2 = nn.Conv2d(out_c, out_c, 3, padding=1)
+        self.shortcut = nn.Conv2d(in_c, out_c, 1) if in_c != out_c else nn.Identity()
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
+
+    def forward(self, x, t):
+        h = self.conv1(self.act(self.norm1(x)))
+        t_emb = self.t_mlp(self.t_act(t))
+        h = h + t_emb[:, :, None, None]
+        h = self.conv2(self.norm2(h))
+        return h + self.shortcut(x)
+
+
+# ----------------------------
+# The Model (Updated for 6 channels)
+# ----------------------------
+
+class DeepResNetUNet(nn.Module):
+    def __init__(self, in_c=6, base=64, blocks_per_level=4):  # in_c changed to 6
+        super().__init__()
+        self.t_mlp = nn.Sequential(
+            nn.Linear(64, base * 4),
+            nn.SiLU(),
+            nn.Linear(base * 4, base * 4)
+        )
+
+        self.head = nn.Conv2d(in_c, base, 3, padding=1)
+
+        # Encoder
+        self.enc1 = nn.ModuleList([WideResBlock(base, base, base * 4) for _ in range(blocks_per_level)])
+        self.down1 = nn.Conv2d(base, base * 2, 4, 2, 1)
+        self.enc2 = nn.ModuleList([WideResBlock(base * 2, base * 2, base * 4) for _ in range(blocks_per_level)])
+        self.down2 = nn.Conv2d(base * 2, base * 4, 4, 2, 1)
+
+        # Bottleneck
+        self.mid_res1 = WideResBlock(base * 4, base * 4, base * 4)
+        self.mid_attn = MultiHeadAttention(base * 4)
+        self.mid_res2 = WideResBlock(base * 4, base * 4, base * 4)
+
+        # Decoder
+        self.up2 = nn.ConvTranspose2d(base * 4, base * 2, 4, 2, 1)
+        self.dec2 = nn.ModuleList([WideResBlock(base * 4, base * 2, base * 4)] +
+                                  [WideResBlock(base * 2, base * 2, base * 4) for _ in range(blocks_per_level - 1)])
+        self.up1 = nn.ConvTranspose2d(base * 2, base, 4, 2, 1)
+        self.dec1 = nn.ModuleList([WideResBlock(base * 2, base, base * 4)] +
+                                  [WideResBlock(base, base, base * 4) for _ in range(blocks_per_level - 1)])
+
+        self.out = nn.Sequential(
+            nn.GroupNorm(32, base),
+            nn.SiLU(),
+            nn.Conv2d(base, 3, 3, padding=1)
+        )
+
+    def forward(self, x, t):
+        t_emb = self.t_mlp(timestep_embedding(t, 64))
+        h = self.head(x)
+        skips = []
+        for block in self.enc1: h = block(h, t_emb)
+        skips.append(h)
+        h = self.down1(h)
+        for block in self.enc2: h = block(h, t_emb)
+        skips.append(h)
+        h = self.down2(h)
+        h = self.mid_res1(h, t_emb)
+        h = self.mid_attn(h)
+        h = self.mid_res2(h, t_emb)
+        h = self.up2(h)
+        h = torch.cat([h, skips.pop()], dim=1)
+        for block in self.dec2: h = block(h, t_emb)
+        h = self.up1(h)
+        h = torch.cat([h, skips.pop()], dim=1)
+        for block in self.dec1: h = block(h, t_emb)
+        return self.out(h)
+
+
+# ----------------------------
+# Core Logic
+# ----------------------------
+
+class FlowMatching:
+    def __init__(self, device):
+        self.device = device
+
+    def get_batch(self, x1, t):
+        t = t.view(-1, 1, 1, 1)
+        x0 = torch.randn_like(x1)
+        xt = (1 - t) * x0 + t * x1
+        target = (x1 - xt) / (1 - t + 1e-5)
+        return xt, target
+
+
+def get_condition(x1):
+    """ Downscales to 16x16, adds 12% noise, then scales back to IMG_SIZE """
+    B, C, H, W = x1.shape
+    # 1. Downscale to 16x16
+    cond = F.interpolate(x1, size=(16, 16), mode='bilinear', align_corners=False)
+    # 2. Add 12% noise (0.12 * N(0,1))
+    cond = cond*(1-NOISE) + NOISE * torch.randn_like(cond)
+    # 3. Scale back to original resolution (24x24) to concatenate
+    cond = F.interpolate(cond, size=(H, W), mode='bilinear', align_corners=False)
+    return cond
+
+
+def plot_history(history, path, window=1000):
+    plt.figure(figsize=(10, 5))
+    values = history["loss"]
+    plt.plot(values, color='#1f77b4', alpha=0.2, label='Raw Loss')
+    if len(values) >= window:
+        sma = np.convolve(values, np.ones(window) / window, mode='valid')
+        plt.plot(range(window - 1, len(values)), sma, color='#1f77b4', linewidth=2, label=f'SMA {window}')
+    plt.ylim(0, 0.3)
+    plt.title("Flow Matching Loss: Linear View")
+    plt.xlabel("Training Steps")
+    plt.ylabel("MSE Loss")
+    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.legend()
+    plt.savefig(path)
+    plt.close()
+
+
+def train():
+    files = glob.glob(os.path.join(DATA_DIR, "*"))
+    tf = transforms.Compose([transforms.Resize((IMG_SIZE, IMG_SIZE)), transforms.ToTensor()])
+    loader = DataLoader(files, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)
+
+    model = DeepResNetUNet(in_c=6, base=64, blocks_per_level=4).to(DEVICE)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
+
+    history = {"loss": []}
+    start_epoch, step = 0, 0
+
+    if os.path.exists(CHECKPOINT_PATH):
+        ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
+        model.load_state_dict(ckpt['model_state'])
+        opt.load_state_dict(ckpt['opt_state'])
+        history = ckpt.get('history', {"loss": []})
+        start_epoch, step = ckpt['epoch'], ckpt['step']
+        print("loaded resuming")
+
+    for epoch in range(start_epoch, EPOCHS):
+        loop = tqdm(loader, desc=f"Epoch {epoch}")
+        for paths in loop:
+            x1 = torch.stack([tf(Image.open(p).convert("RGB")) for p in paths]).to(DEVICE)
+            x1 = x1 * 2 - 1  # Range [-1, 1]
+
+            # Create the 16x16-noisy condition
+            cond = get_condition(x1)
+
+            t = torch.rand(x1.shape[0], device=DEVICE)
+            xt, target = FlowMatching(DEVICE).get_batch(x1, t)
+
+            # Concatenate noise-state and condition for 6-channel input
+            # [B, 3, 24, 24] + [B, 3, 24, 24] -> [B, 6, 24, 24]
+            inp = torch.cat([xt, cond], dim=1)
+
+            pred = model(inp, t)
+            loss = F.mse_loss(pred, target)
+
+            loss.backward()
+            opt.step()
+            opt.zero_grad()
+
+            history["loss"].append(loss.item())
+            step += 1
+            loop.set_postfix(loss=f"{loss.item():.4f}")
+
+            if step % 200 == 0:
+                plot_history(history, f"{OUT_DIR}/loss_graph.png", window=250)
+
+            if step % PREVIEW_EVERY == 0:
+                torch.save({'model_state': model.state_dict(), 'opt_state': opt.state_dict(),
+                            'epoch': epoch, 'step': step, 'history': history}, CHECKPOINT_PATH)
+
+                model.eval()
+                with torch.no_grad():
+                    # Use a small test batch
+                    test_x1 = x1[:16]
+                    test_cond = get_condition(test_x1)
+                    cur = torch.randn(16, 3, IMG_SIZE, IMG_SIZE).to(DEVICE)
+
+                    for i in range(50):
+                        ts = torch.full((16,), i / 50.0, device=DEVICE)
+                        # Concatenate current state with fixed condition
+                        model_inp = torch.cat([cur, test_cond], dim=1)
+                        v = model(model_inp, ts)
+                        cur = cur + v * (1.0 / 50)
+
+                    # Prepare export: [Condition | Prediction | Ground Truth]
+                    # Rescale to [0, 1]
+                    vis_cond = (test_cond + 1) * 0.5
+                    vis_pred = (cur + 1) * 0.5
+                    vis_gt = (test_x1 + 1) * 0.5
+
+                    # Concatenate horizontally per sample, then vertically
+                    comparison = torch.cat([vis_cond, vis_pred, vis_gt], dim=3)
+                    save_image(comparison, f"{OUT_DIR}/previews/step_{step}.png", nrow=1)
+
+                model.train()
+
+
+if __name__ == "__main__":
+    while True:
+        train()
