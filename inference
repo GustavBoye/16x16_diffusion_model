@@ -1,0 +1,211 @@
+"""
+inference_24x24_cond.py
+Inference script for 24x24 Flow Matching with 16x16 noisy conditioning.
+"""
+
+import os
+import math
+import glob
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from PIL import Image
+from torchvision import transforms
+from torchvision.utils import save_image
+from tqdm import tqdm
+
+# ----------------------------
+# Config
+# ----------------------------
+INPUT_FOLDER = r"C:\Users\G_Cha\PycharmProjects\PythonProject1\ICONs\16\Model_A_bigger\Generated_Icons"
+MODEL_PATH = r"C:\Users\G_Cha\PycharmProjects\PythonProject1\ICONs\24\from_16\deep_flow_matching_24x24_cond\checkpoint.pth"
+OUTPUT_DIR = "inference_results_24x24"
+
+IMG_SIZE = 24  # Target resolution
+COND_SIZE = 16  # The internal "low res" bottleneck
+NOISE_LEVEL = 0.05  # Matches your NOISE = 0.1 from training
+SAMPLING_STEPS = 50
+BATCH_SIZE = 16
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print("INPUT_FOLDER:", INPUT_FOLDER)
+print("Exists:", os.path.exists(INPUT_FOLDER))
+print("Is dir:", os.path.isdir(INPUT_FOLDER))
+print("Dir contents:", os.listdir(INPUT_FOLDER)[:10])
+
+
+
+# ----------------------------
+# Helper Logic
+# ----------------------------
+
+def get_condition_inference(x_in):
+    """
+    Matches your training logic:
+    Downscale to 16, Add noise, Upscale to 24.
+    """
+    # 1. Downscale to 16x16
+    cond = F.interpolate(x_in, size=(COND_SIZE, COND_SIZE), mode='bilinear', align_corners=False)
+
+    # 2. Add noise exactly like training: cond*(1-NOISE) + NOISE*randn
+    cond = cond * (1 - NOISE_LEVEL) + NOISE_LEVEL * torch.randn_like(cond)
+
+    # 3. Scale back to 24x24
+    cond = F.interpolate(cond, size=(IMG_SIZE, IMG_SIZE), mode='bilinear', align_corners=False)
+    return cond
+
+
+def timestep_embedding(t, dim):
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000) * torch.arange(0, half, device=t.device) / half)
+    args = t[:, None].float() * freqs[None]
+    return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+
+
+# ----------------------------
+# Architecture (Must match training exactly)
+# ----------------------------
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, channels, heads=4, dropout=0.0):
+        super().__init__()
+        self.heads = heads
+        self.dim_head = channels // heads
+        self.scale = self.dim_head ** -0.5
+        self.norm = nn.GroupNorm(min(32, channels), channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=False)
+        self.proj = nn.Conv2d(channels, channels, 1)
+        self.dropout = nn.Dropout(dropout)
+        self.gamma = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h)
+        q, k, v = qkv.chunk(3, dim=1)
+        q = q.view(B, self.heads, self.dim_head, H * W).transpose(2, 3)
+        k = k.view(B, self.heads, self.dim_head, H * W)
+        v = v.view(B, self.heads, self.dim_head, H * W).transpose(2, 3)
+        attn = (torch.matmul(q, k) * self.scale).softmax(dim=-1)
+        out = torch.matmul(self.dropout(attn), v).transpose(2, 3).reshape(B, C, H, W)
+        return x + self.gamma * self.proj(out)
+
+
+class WideResBlock(nn.Module):
+    def __init__(self, in_c, out_c, t_dim):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(min(32, in_c), in_c)
+        self.act = nn.LeakyReLU(0.2, inplace=True)
+        self.conv1 = nn.Conv2d(in_c, out_c, 3, padding=1)
+        self.t_mlp = nn.Linear(t_dim, out_c)
+        self.norm2 = nn.GroupNorm(min(32, out_c), out_c)
+        self.conv2 = nn.Conv2d(out_c, out_c, 3, padding=1)
+        self.shortcut = nn.Conv2d(in_c, out_c, 1) if in_c != out_c else nn.Identity()
+
+    def forward(self, x, t):
+        h = self.conv1(self.act(self.norm1(x)))
+        h = h + self.t_mlp(self.act(t))[:, :, None, None]
+        h = self.conv2(self.norm2(h))
+        return h + self.shortcut(x)
+
+
+class DeepResNetUNet(nn.Module):
+    def __init__(self, in_c=6, base=64, blocks_per_level=4):
+        super().__init__()
+        self.t_mlp = nn.Sequential(nn.Linear(64, base * 4), nn.SiLU(), nn.Linear(base * 4, base * 4))
+        self.head = nn.Conv2d(in_c, base, 3, padding=1)
+        self.enc1 = nn.ModuleList([WideResBlock(base, base, base * 4) for _ in range(blocks_per_level)])
+        self.down1 = nn.Conv2d(base, base * 2, 4, 2, 1)
+        self.enc2 = nn.ModuleList([WideResBlock(base * 2, base * 2, base * 4) for _ in range(blocks_per_level)])
+        self.down2 = nn.Conv2d(base * 2, base * 4, 4, 2, 1)
+        self.mid_res1 = WideResBlock(base * 4, base * 4, base * 4)
+        self.mid_attn = MultiHeadAttention(base * 4)
+        self.mid_res2 = WideResBlock(base * 4, base * 4, base * 4)
+        self.up2 = nn.ConvTranspose2d(base * 4, base * 2, 4, 2, 1)
+        self.dec2 = nn.ModuleList(
+            [WideResBlock(base * 4, base * 2, base * 4)] + [WideResBlock(base * 2, base * 2, base * 4) for _ in
+                                                            range(blocks_per_level - 1)])
+        self.up1 = nn.ConvTranspose2d(base * 2, base, 4, 2, 1)
+        self.dec1 = nn.ModuleList(
+            [WideResBlock(base * 2, base, base * 4)] + [WideResBlock(base, base, base * 4) for _ in
+                                                        range(blocks_per_level - 1)])
+        self.out = nn.Sequential(nn.GroupNorm(32, base), nn.SiLU(), nn.Conv2d(base, 3, 3, padding=1))
+
+    def forward(self, x, t):
+        # Note: Concatenation happens inside the main loop for this logic
+        t_emb = self.t_mlp(timestep_embedding(t, 64))
+        h = self.head(x)
+        skips = []
+        for b in self.enc1: h = b(h, t_emb)
+        skips.append(h)
+        h = self.down1(h)
+        for b in self.enc2: h = b(h, t_emb)
+        skips.append(h)
+        h = self.down2(h)
+        h = self.mid_res1(h, t_emb)
+        h = self.mid_attn(h)
+        h = self.mid_res2(h, t_emb)
+        h = self.up2(h)
+        h = torch.cat([h, skips.pop()], dim=1)
+        for b in self.dec2: h = b(h, t_emb)
+        h = self.up1(h)
+        h = torch.cat([h, skips.pop()], dim=1)
+        for b in self.dec1: h = b(h, t_emb)
+        return self.out(h)
+
+
+# ----------------------------
+# Inference Run
+# ----------------------------
+
+def run_inference():
+    model = DeepResNetUNet(in_c=6, base=64).to(DEVICE)
+    if not os.path.exists(MODEL_PATH):
+        print(f"Error: Checkpoint not found at {MODEL_PATH}")
+        return
+
+    ckpt = torch.load(MODEL_PATH, map_location=DEVICE)
+    model.load_state_dict(ckpt['model_state'] if 'model_state' in ckpt else ckpt)
+    model.eval()
+
+    image_paths = [p for p in glob.glob(os.path.join(INPUT_FOLDER, "*")) if
+                   p.lower().endswith(('.png', '.jpg', '.jpeg'))]
+
+    tf = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Lambda(lambda x: x * 2 - 1)
+    ])
+
+    with torch.no_grad():
+        for i in range(0, len(image_paths), BATCH_SIZE):
+            batch_p = image_paths[i: i + BATCH_SIZE]
+            names = [os.path.basename(p) for p in batch_p]
+
+            # Load and create condition
+            imgs = torch.stack([tf(Image.open(p).convert("RGB")) for p in batch_p]).to(DEVICE)
+            cond = get_condition_inference(imgs)
+
+            # Start from noise
+            cur = torch.randn(imgs.shape[0], 3, IMG_SIZE, IMG_SIZE).to(DEVICE)
+
+            dt = 1.0 / SAMPLING_STEPS
+            for step in range(SAMPLING_STEPS):
+                ts = torch.full((imgs.shape[0],), step / SAMPLING_STEPS, device=DEVICE)
+                # Model expects 6 channels: [latent, condition]
+                inp = torch.cat([cur, cond], dim=1)
+                v = model(inp, ts)
+                cur = cur + v * dt
+
+            # Save results
+            res = (cur + 1) * 0.5
+            for j in range(res.shape[0]):
+                save_image(res[j].clamp(0, 1), os.path.join(OUTPUT_DIR, f"out_{names[j]}"))
+
+    print(f"Finished! Images saved to {OUTPUT_DIR}")
+
+
+if __name__ == "__main__":
+    run_inference()
